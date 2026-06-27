@@ -1,0 +1,533 @@
+#!/usr/bin/env -S uv run python
+"""
+Convert a Markdown file to a PowerPoint (.pptx) file.
+
+Creates a 16:9 deck whose slides do not overflow. Long
+sections are split automatically across multiple slides,
+with "(continued)" appended to the title of any overflow
+slide so the reading order stays clear.
+
+Handles:
+  * ATX headings (#, ##, ###, ...)
+  * Paragraphs (with **bold**, *italic*, `code` inline)
+  * Bullet and numbered lists (nested up to 4 levels)
+  * Fenced code blocks (```...```)
+
+Usage:
+    md2ppt input.md
+    md2ppt input.md output.pptx
+
+If the output path is omitted, the .pptx is written next
+to the input file with a .pptx extension.
+
+Requires: python-pptx.
+
+Created: 2026-04-22
+Last updated: 2026-04-22
+"""
+
+import re
+import sys
+from pathlib import Path
+
+from pptx import Presentation
+from pptx.dml.color import RGBColor
+from pptx.util import Inches, Pt
+
+
+SLIDE_W = 13.333
+SLIDE_H = 7.5
+TITLE_LEFT = 0.5
+TITLE_TOP = 0.3
+TITLE_W = 12.333
+TITLE_H = 0.9
+BODY_LEFT = 0.5
+BODY_TOP = 1.3
+BODY_W = 12.333
+BODY_H = 5.9
+
+TITLE_FONT = "Calibri"
+TITLE_SIZE = 32
+BODY_FONT = "Calibri"
+BODY_SIZE = 18
+CODE_FONT = "Consolas"
+CODE_SIZE = 14
+
+LINES_PER_SLIDE = 19
+CHARS_PER_LINE = 95
+CODE_CHARS_PER_LINE = 115
+INDENT_CHARS = 4
+
+
+# --------------------------------------------------------------
+def read_markdown(path):
+    """Read a markdown file as text."""
+    return Path(path).read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------
+def is_heading(line):
+    """True if the line is an ATX heading."""
+    return bool(re.match(r"^#{1,6}\s+\S", line))
+
+
+# --------------------------------------------------------------
+def heading_block(line):
+    """Build a heading block from an ATX line."""
+    m = re.match(r"^(#{1,6})\s+(.*)$", line)
+    level = len(m.group(1))
+    return {"type": f"h{level}", "text": m.group(2).strip()}
+
+
+# --------------------------------------------------------------
+def is_list_item(line):
+    """True if the line starts a list item."""
+    return bool(re.match(r"^\s*([-*+]|\d+\.)\s+\S", line))
+
+
+# --------------------------------------------------------------
+def list_item_block(line):
+    """Build a list-item block from a markdown line."""
+    m = re.match(r"^(\s*)([-*+]|\d+\.)\s+(.*)$", line)
+    indent = len(m.group(1)) // 2
+    marker = m.group(2)
+    ordered = marker.endswith(".")
+    return {
+        "type": "li",
+        "indent": indent,
+        "ordered": ordered,
+        "marker": marker,
+        "text": m.group(3).rstrip(),
+    }
+
+
+# --------------------------------------------------------------
+def parse_code(lines, i):
+    """Parse a fenced code block starting at index i."""
+    lang = lines[i][3:].strip()
+    body = []
+    i += 1
+    while i < len(lines) and not lines[i].startswith("```"):
+        body.append(lines[i])
+        i += 1
+    i += 1
+    return i, {"type": "code", "lang": lang, "lines": body}
+
+
+# --------------------------------------------------------------
+def parse_paragraph(lines, i):
+    """Parse a paragraph of consecutive non-empty lines."""
+    parts = []
+    while i < len(lines):
+        ln = lines[i]
+        if not ln.strip():
+            break
+        if is_heading(ln) or is_list_item(ln):
+            break
+        if ln.startswith("```"):
+            break
+        parts.append(ln.strip())
+        i += 1
+    return i, {"type": "para", "text": " ".join(parts)}
+
+
+# --------------------------------------------------------------
+def parse_markdown(text):
+    """Parse markdown into a flat list of blocks."""
+    lines = text.splitlines()
+    blocks = []
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if ln.startswith("```"):
+            i, blk = parse_code(lines, i)
+            blocks.append(blk)
+        elif is_heading(ln):
+            blocks.append(heading_block(ln))
+            i += 1
+        elif is_list_item(ln):
+            blocks.append(list_item_block(ln))
+            i += 1
+        elif ln.strip() == "":
+            i += 1
+        else:
+            i, blk = parse_paragraph(lines, i)
+            blocks.append(blk)
+    return blocks
+
+
+# --------------------------------------------------------------
+def wrap_count(text, width):
+    """Count word-wrapped lines for text at given width."""
+    if not text:
+        return 1
+    words = text.split()
+    lines = 1
+    col = 0
+    for w in words:
+        wl = len(w)
+        if col == 0:
+            col = wl
+        elif col + 1 + wl <= width:
+            col += 1 + wl
+        else:
+            lines += 1
+            col = wl
+    return lines
+
+
+# --------------------------------------------------------------
+def code_line_count(block):
+    """Count visible lines in a code block."""
+    n = 0
+    for ln in block["lines"]:
+        if not ln:
+            n += 1
+        else:
+            w = CODE_CHARS_PER_LINE
+            n += max(1, (len(ln) + w - 1) // w)
+    return n
+
+
+# --------------------------------------------------------------
+def block_lines(block):
+    """Estimate the visual line count for a block."""
+    t = block["type"]
+    if t.startswith("h"):
+        return wrap_count(block["text"], CHARS_PER_LINE) + 1
+    if t == "para":
+        return wrap_count(block["text"], CHARS_PER_LINE) + 1
+    if t == "li":
+        indent = block.get("indent", 0) * INDENT_CHARS
+        w = max(20, CHARS_PER_LINE - indent - 2)
+        return wrap_count(block["text"], w)
+    if t == "code":
+        return code_line_count(block) + 1
+    return 1
+
+
+# --------------------------------------------------------------
+def _code_line_cost(ln):
+    """Wrapped-line cost for a single code line."""
+    if not ln:
+        return 1
+    w = CODE_CHARS_PER_LINE
+    return max(1, (len(ln) + w - 1) // w)
+
+
+# --------------------------------------------------------------
+def split_code(block):
+    """Split a code block into slide-sized chunks."""
+    cap = LINES_PER_SLIDE - 2
+    chunks = []
+    buf = []
+    used = 0
+    for ln in block["lines"]:
+        cost = _code_line_cost(ln)
+        if used + cost > cap and buf:
+            chunks.append(buf)
+            buf = []
+            used = 0
+        buf.append(ln)
+        used += cost
+    if buf:
+        chunks.append(buf)
+    return [
+        {"type": "code", "lang": block["lang"], "lines": c}
+        for c in chunks
+    ]
+
+
+# --------------------------------------------------------------
+def split_para(block):
+    """Split an oversized paragraph at word boundaries."""
+    cap = LINES_PER_SLIDE - 2
+    words = block["text"].split()
+    chunks = []
+    buf = []
+    col = 0
+    lines = 1
+    for w in words:
+        wl = len(w)
+        if col and col + 1 + wl > CHARS_PER_LINE:
+            lines += 1
+            col = 0
+        if lines > cap:
+            chunks.append(" ".join(buf))
+            buf = []
+            lines = 1
+            col = 0
+        col = wl if col == 0 else col + 1 + wl
+        buf.append(w)
+    if buf:
+        chunks.append(" ".join(buf))
+    return [{"type": "para", "text": c} for c in chunks]
+
+
+# --------------------------------------------------------------
+def split_block(block):
+    """Split a block if it doesn't fit on one slide."""
+    if block_lines(block) <= LINES_PER_SLIDE:
+        return [block]
+    if block["type"] == "code":
+        return split_code(block)
+    if block["type"] == "para":
+        return split_para(block)
+    return [block]
+
+
+# --------------------------------------------------------------
+def emit_slide(state):
+    """Emit the current slide if it has content."""
+    if not state["title"] and not state["body"]:
+        return
+    suffix = " (continued)" if state["cont"] else ""
+    title = state["title"] + suffix if state["title"] else ""
+    state["slides"].append((title, list(state["body"])))
+    state["body"] = []
+    state["used"] = 0
+    state["cont"] = True
+
+
+# --------------------------------------------------------------
+def fit_piece(state, piece):
+    """Fit a piece in the current slide or overflow."""
+    n = block_lines(piece)
+    if state["used"] + n > LINES_PER_SLIDE and state["body"]:
+        emit_slide(state)
+    state["body"].append(piece)
+    state["used"] += n
+
+
+# --------------------------------------------------------------
+def fit_to_slides(blocks):
+    """Pack blocks into slide-sized units."""
+    state = {
+        "slides": [], "title": "", "body": [],
+        "used": 0, "cont": False,
+    }
+    for blk in blocks:
+        if blk["type"] in ("h1", "h2"):
+            emit_slide(state)
+            state["title"] = blk["text"]
+            state["cont"] = False
+        else:
+            for piece in split_block(blk):
+                fit_piece(state, piece)
+    emit_slide(state)
+    return state["slides"]
+
+
+# --------------------------------------------------------------
+def make_presentation():
+    """Create a blank 16:9 presentation."""
+    prs = Presentation()
+    prs.slide_width = Inches(SLIDE_W)
+    prs.slide_height = Inches(SLIDE_H)
+    return prs
+
+
+# --------------------------------------------------------------
+def add_blank_slide(prs):
+    """Add a blank slide and return it."""
+    return prs.slides.add_slide(prs.slide_layouts[6])
+
+
+# --------------------------------------------------------------
+def add_title_textbox(slide, text):
+    """Add a title textbox with the given text."""
+    tb = slide.shapes.add_textbox(
+        Inches(TITLE_LEFT), Inches(TITLE_TOP),
+        Inches(TITLE_W), Inches(TITLE_H),
+    )
+    tf = tb.text_frame
+    tf.word_wrap = True
+    p = tf.paragraphs[0]
+    run = p.add_run()
+    run.text = text
+    run.font.name = TITLE_FONT
+    run.font.size = Pt(TITLE_SIZE)
+    run.font.bold = True
+    run.font.color.rgb = RGBColor(0x1F, 0x3A, 0x68)
+
+
+# --------------------------------------------------------------
+def add_body_textbox(slide):
+    """Add an empty body textbox and return its text frame."""
+    tb = slide.shapes.add_textbox(
+        Inches(BODY_LEFT), Inches(BODY_TOP),
+        Inches(BODY_W), Inches(BODY_H),
+    )
+    tf = tb.text_frame
+    tf.word_wrap = True
+    return tf
+
+
+# --------------------------------------------------------------
+def parse_inline(text):
+    """Split text into styled inline segments."""
+    pat = re.compile(r"(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)")
+    segs = []
+    for part in pat.split(text):
+        if not part:
+            continue
+        if part.startswith("**"):
+            segs.append((part[2:-2], True, False, False))
+        elif part.startswith("`"):
+            segs.append((part[1:-1], False, False, True))
+        elif part.startswith("*"):
+            segs.append((part[1:-1], False, True, False))
+        else:
+            segs.append((part, False, False, False))
+    return segs
+
+
+# --------------------------------------------------------------
+def apply_inline_runs(p, text, size, bold=False):
+    """Add styled runs for inline markdown to paragraph p."""
+    for seg, b, i, c in parse_inline(text):
+        run = p.add_run()
+        run.text = seg
+        run.font.name = CODE_FONT if c else BODY_FONT
+        run.font.size = Pt(size)
+        run.font.bold = bold or b
+        run.font.italic = i
+
+
+# --------------------------------------------------------------
+def new_para(tf, first):
+    """Return a usable paragraph in the text frame."""
+    if first and not tf.paragraphs[0].runs:
+        return tf.paragraphs[0]
+    return tf.add_paragraph()
+
+
+# --------------------------------------------------------------
+def render_heading(tf, block, first):
+    """Render an H3+ heading inline in the body."""
+    p = new_para(tf, first)
+    p.space_before = Pt(4)
+    run = p.add_run()
+    run.text = block["text"]
+    run.font.name = BODY_FONT
+    level = int(block["type"][1:])
+    size = max(14, BODY_SIZE + (5 - level) * 2)
+    run.font.size = Pt(size)
+    run.font.bold = True
+
+
+# --------------------------------------------------------------
+def render_paragraph(tf, block, first):
+    """Render a plain paragraph."""
+    p = new_para(tf, first)
+    p.space_after = Pt(6)
+    apply_inline_runs(p, block["text"], BODY_SIZE)
+
+
+# --------------------------------------------------------------
+def render_li(tf, block, first):
+    """Render a list item with a visible bullet marker."""
+    p = new_para(tf, first)
+    p.space_after = Pt(2)
+    indent = block.get("indent", 0)
+    if block["ordered"]:
+        bullet = f"{block['marker']} "
+    else:
+        bullet = "•  "
+    prefix = ("    " * indent) + bullet
+    head = p.add_run()
+    head.text = prefix
+    head.font.name = BODY_FONT
+    head.font.size = Pt(BODY_SIZE)
+    apply_inline_runs(p, block["text"], BODY_SIZE)
+
+
+# --------------------------------------------------------------
+def render_code(tf, block, first):
+    """Render a fenced code block line by line."""
+    for idx, ln in enumerate(block["lines"]):
+        p = new_para(tf, first and idx == 0)
+        run = p.add_run()
+        run.text = ln if ln else " "
+        run.font.name = CODE_FONT
+        run.font.size = Pt(CODE_SIZE)
+        run.font.color.rgb = RGBColor(0x22, 0x22, 0x22)
+
+
+# --------------------------------------------------------------
+def render_block(tf, block, first):
+    """Render one block into the body text frame."""
+    t = block["type"]
+    if t.startswith("h"):
+        render_heading(tf, block, first)
+    elif t == "para":
+        render_paragraph(tf, block, first)
+    elif t == "li":
+        render_li(tf, block, first)
+    elif t == "code":
+        render_code(tf, block, first)
+
+
+# --------------------------------------------------------------
+def build_slide(prs, title, body):
+    """Build one slide with a title and body blocks."""
+    slide = add_blank_slide(prs)
+    if title:
+        add_title_textbox(slide, title)
+    if body:
+        tf = add_body_textbox(slide)
+        for idx, blk in enumerate(body):
+            render_block(tf, blk, idx == 0)
+
+
+# --------------------------------------------------------------
+def build_presentation(slides, out_path):
+    """Build and save the presentation file."""
+    prs = make_presentation()
+    for title, body in slides:
+        build_slide(prs, title, body)
+    prs.save(str(out_path))
+
+
+# --------------------------------------------------------------
+def usage_and_exit(msg=None):
+    """Print usage (with optional error) and exit."""
+    if msg:
+        print(msg)
+    print("Usage: md2ppt input.md [output.pptx]")
+    sys.exit(1)
+
+
+# --------------------------------------------------------------
+def resolve_paths(args):
+    """Determine input and output paths from argv."""
+    if len(args) < 1 or len(args) > 2:
+        usage_and_exit()
+    md_path = Path(args[0]).expanduser().resolve()
+    if not md_path.is_file():
+        print(f"Not found: {md_path}")
+        sys.exit(1)
+    if len(args) == 2:
+        out_path = Path(args[1]).expanduser().resolve()
+    else:
+        out_path = md_path.with_suffix(".pptx")
+    return md_path, out_path
+
+
+# --------------------------------------------------------------
+def main():
+    """Parse arguments and run the conversion."""
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        return
+    md_path, out_path = resolve_paths(sys.argv[1:])
+    text = read_markdown(md_path)
+    blocks = parse_markdown(text)
+    slides = fit_to_slides(blocks)
+    build_presentation(slides, out_path)
+    print(f"Wrote {out_path} ({len(slides)} slides)")
+
+
+# --------------------------------------------------------------
+if __name__ == "__main__":
+    main()
